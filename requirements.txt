@@ -1,0 +1,7 @@
+asyncio-mqtt==0.16.1
+importlib-metadata==6.0.0
+msur-crc==1.0.1
+paho-mqtt==1.6.1
+pydantic==1.10.4
+typing_extensions==4.4.0
+zipp==3.11.0
