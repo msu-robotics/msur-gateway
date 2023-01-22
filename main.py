@@ -1,16 +1,18 @@
-from src.service import Gateway
-from pydantic import BaseSettings, AmqpDsn, IPvAnyAddress
 import asyncio
 import logging
+
+from pydantic import BaseSettings, AmqpDsn, IPvAnyAddress
+
+from src.service import Gateway
+
 logging.basicConfig(level=logging.INFO)
 
 
 class Config(BaseSettings):
     MQTT_BROKER: AmqpDsn
     HOST_IP: IPvAnyAddress = '127.0.0.1'
-    HOST_PORT: int = 9000
-    TELEMETRY_TOPIK: str = 'auv/telemetry'
-    CONTROL_TOPIK: str = 'auv/control'
+    HOST_PORT: int = 2065
+    AUV_TOPIK: str = 'auv'
 
     class Config:
         case_sensitive = True
@@ -19,8 +21,7 @@ class Config(BaseSettings):
 async def main():
     config = Config()
     gateway = Gateway(config.MQTT_BROKER.host, config.HOST_IP,
-        config.MQTT_BROKER.port, config.HOST_PORT, config.TELEMETRY_TOPIK,
-        config.CONTROL_TOPIK)
+        config.MQTT_BROKER.port, config.HOST_PORT, config.AUV_TOPIK)
     try:
         await gateway.run()
     except Exception as e:

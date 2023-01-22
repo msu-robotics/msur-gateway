@@ -1,15 +1,17 @@
+import asyncio
+import json
+import logging
 import struct
 from typing import Optional, Callable
-from collections import OrderedDict
 
-import asyncio
 import asyncio_mqtt as aiomqtt
-from queue import Queue
-import logging
-from src.models import AUV, Telemetry
-from msur_crc.crc16 import crc16
 import paho.mqtt.client as mqtt
-import json
+from msur_crc.crc16 import crc16
+from rich.console import Console
+
+from src.models import AUV, Telemetry, PidSettings, PidConfig, PidStatus
+
+console = Console()
 
 
 class Encoder:
@@ -19,17 +21,29 @@ class Encoder:
         self._telemetry = struct.Struct('!BBffffffffffffBBBBf')
         self._auv = struct.Struct('!BBbbbbfffffBBBffB')
         self._crc16 = struct.Struct('!H')
+        self._pid = struct.Struct('!BBfff')
+        self._reboot = struct.Struct('!BBBBBBBB')
 
     def encode(self, obj) -> bytes:
         if isinstance(obj, AUV):
-            package = self._auv.pack(0, 230, obj.thrust_x, obj.thrust_y,
-                obj.thrust_z, obj.depth, obj.altitude, obj.yaw, obj.velocity_x,
-                obj.velocity_y, int(obj.pid), int(obj.payload),
-                obj.navigation, 0, 0, 0, 0)
-            crc = self._crc16.pack(crc16(package))
-            return package + crc
+            values = [0, 230, obj.thrust_x, obj.thrust_y, obj.thrust_w,
+                      obj.thrust_z, obj.depth, obj.altitude, obj.yaw,
+                      obj.velocity_x, obj.velocity_y, int(obj.pid.status),
+                      int(obj.payload), int(obj.navigation), 0, 0, 0]
+            # print(values)
+            package = self._auv.pack(*values)
+        elif isinstance(obj, PidSettings):
+            # обновляем коэффициент
+            values = [0, obj.type, obj.p, obj.i, obj.d]
+            package = self._pid.pack(*values)
+        elif isinstance(obj, PidConfig):
+            # сохраняем настройки ПИД
+            package = self._reboot.pack(0, 133, 0, 0, 0, 1, 0, 0)
         else:
             raise ValueError('Не верный тип объекта')
+
+        crc = self._crc16.pack(crc16(package))
+        return package + crc
 
     def decode(self, msg: bytes) -> Optional[Telemetry]:
         if len(msg) < 2:
@@ -87,8 +101,7 @@ class Gateway:
     Сервис для взаимодействия с аппаратом
     """
 
-    def __init__(self, mqtt_host, host, mqtt_port, port, telemetry_topik,
-            control_topik):
+    def __init__(self, mqtt_host, host, mqtt_port, port, auv_topik):
         """
 
         Args:
@@ -96,24 +109,35 @@ class Gateway:
             host: Локальный интерфейс для связи с аппаратом
             mqtt_port: Порт брокера mqtt
             port: Локальный порт для связи с аппаратом
-            telemetry_topik: Топик для публикации телеметрии
-            control_topik: Топик для прослушивания управления
+            auv_topik: Топик для AUV
         """
-        logging.info(f'Ожидание входящих пакетов на: {host}:{port}')
-        logging.info(f'MQTT Broker: {mqtt_host}:{mqtt_port}')
-        logging.info(f'Топик телеметрии: {telemetry_topik}')
-        logging.info(f'Топик управления: {control_topik}')
+        console.rule("[bold red]MSUR GATEWAY")
+
+        console.print(
+            f"[blue]Ожидание входящих пакетов на: [bold red]{host}:{port}")
+        console.print(
+            f"[blue]MQTT Broker: [bold red]{mqtt_host}:{mqtt_port}")
+        console.print(
+            f"[blue]Топик телеметрии: [bold red]{auv_topik}/telemetry")
+        console.print(
+            f"[blue]Топик управления: [bold red]{auv_topik}/control")
+        console.print(
+            f"[blue]Топик информации: [bold red]{auv_topik}/info")
+        console.rule("[bold red]Форматы сообщений")
+        console.print(
+            f"[blue]Управление AUV:")
+        console.print(AUV.schema())
 
         self._host = str(host)
         self._port = int(port)
         self._mqtt_host = mqtt_host
         self._mqtt_port = int(mqtt_port)
-        self._control_topik = control_topik
-        self._telemetry_topik = telemetry_topik
+        self._control_topik = auv_topik + '/control'
+        self._telemetry_topik = auv_topik + '/telemetry'
+        self._info_topik = auv_topik + '/info'
 
         self._transport = None
 
-        self._queue = Queue()
         self._auv = AUV()
         self._encoder = Encoder()
 
@@ -123,49 +147,10 @@ class Gateway:
         self._package_counter = 0
 
     def _control(self, control: dict):
-        if control.get('type', 0) == 230:
-            if 'thrust_x' in control:
-                self._auv.thrust_x = float(control['thrust_x'])
-            if 'thrust_y' in control:
-                self._auv.thrust_y = float(control['thrust_y'])
-            if 'thrust_z' in control:
-                self._auv.thrust_z = float(control['thrust_z'])
-            if 'thrust_w' in control:
-                self._auv.thrust_w = float(control['thrust_w'])
-            if 'depth' in control:
-                self._auv.depth = float(control['depth'])
-            if 'altitude' in control:
-                self._auv.altitude = float(control['altitude'])
-            if 'yaw' in control:
-                self._auv.yaw = float(control['yaw'])
-            if 'velocity_x' in control:
-                self._auv.velocity_x = float(control['velocity_x'])
-            if 'velocity_y' in control:
-                self._auv.velocity_y = float(control['velocity_y'])
-            if 'pid' in control:
-                pid = control['pid']
-                if 'yaw' in pid:
-                    self._auv.pid.yaw = bool(pid['yaw'])
-                if 'pitch' in pid:
-                    self._auv.pid.pitch = bool(pid['pitch'])
-                if 'roll' in pid:
-                    self._auv.pid.roll = bool(pid['roll'])
-                if 'speed_x' in pid:
-                    self._auv.pid.speed_x = bool(pid['speed_x'])
-                if 'speed_y' in pid:
-                    self._auv.pid.speed_y = bool(pid['speed_y'])
-                if 'altitude' in pid:
-                    self._auv.pid.altitude = bool(pid['altitude'])
-                if 'depth' in pid:
-                    self._auv.pid.depth = bool(pid['depth'])
-            if 'payload' in control:
-                payload = control['payload']
-                if 'magnet_1' in payload:
-                    self._auv.payload.magnet_1 = bool(payload['magnet_1'])
-                if 'magnet_2' in payload:
-                    self._auv.payload.magnet_2 = bool(payload['magnet_2'])
-        elif control.get('type', 0) == 110:
-            pass
+        try:
+            self._auv.update(control)
+        except AttributeError:
+            console.print_exception()
 
     async def _mqtt_subscriber(self):
         """Обрабатывает сообщения из auv/control и обновляет состояние аппарата
@@ -188,13 +173,13 @@ class Gateway:
 
     def _get_package(self) -> bytes:
         """Возвращает пакет управления для аппарата"""
-        return self._encoder.encode(self._auv)
+        return self._encoder.encode(self._auv.get_parcel())
 
     def _publish_package(self, msg: bytes):
         """Получает телеметрию с аппарата"""
         telemetry = self._encoder.decode(msg)
         if telemetry:
-            self._mqtt_client.publish(self._telemetry_topik, telemetry.dict())
+            self._mqtt_client.publish(self._telemetry_topik, telemetry.json())
 
     def get_protocol(self):
         return DatagramProtocol(self._get_package, self._publish_package, 2030)

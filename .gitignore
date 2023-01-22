@@ -1,0 +1,5 @@
+*.puml
+.idea
+*.pyc
+venv
+.env
